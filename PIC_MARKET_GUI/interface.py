@@ -1,170 +1,216 @@
 """
-interface.py - Fenetre principale de la caisse PIC-MARKET (Tkinter).
+interface.py - Fenetre de la caisse PIC-MARKET (Tkinter).
 
 Lancer :  py interface.py
 
-Contenu attendu (TS4.2 / TS4.3) :
-  - statut de la connexion USB
-  - dernier code-barres recu + reconnu / inconnu
-  - tableau : Produit | Prix unitaire | Quantite | Sous-total
-  - total general, recalcule apres chaque scan
-  - bouton "Nouvelle transaction" (TS1.9)
-  - zone de SIMULATION (en attendant l'USB HID)
-
-Architecture choisie (OPTION A) : le catalogue est DANS LE PIC.
-  - Le PIC decide lui-meme si le produit est connu (LED verte/rouge, buzzer, GLCD).
-  - Il envoie ensuite a Python : code + nom + prix  (ou "code inconnu").
-  - Python NE recherche donc PAS le produit : il affiche ce que le PIC envoie.
-  - Seul le SIMULATEUR utilise chercher_produit(), pour imiter le PIC.
-
-Regle d'or : cette classe ne fait QUE de l'affichage. Les calculs restent
-dans panier.py (ajouter, total, vider), les prix sont formates avec
-formater_prix(). Ne jamais faire de calcul de prix ici.
+Toutes les 50 ms, on lit les trames du PIC (ou on retente la connexion),
+puis on met a jour le ticket, le total, le dernier code et les messages.
+Le bouton Payer est affiche mais n'a pas encore d'action.
 """
 import tkinter as tk
 from tkinter import ttk
 
-from panier import Panier
-from produits import chercher_produit, formater_prix
+from caisse import Caisse
+from panier import formater_prix
+
+PERIODE_LECTURE_USB = 50        # ms
+
+FOND = "#eef1f5"
+BANDEAU = "#1f2a44"
+AFFICHEUR = "#111827"
+CHIFFRES = "#4ade80"
+BLANC = "#ffffff"
+GRIS = "#6b7280"
+BLEU = "#2563eb"
+VERT = "#16a34a"
+ROUGE = "#dc2626"
+ROUGE_CLAIR = "#f87171"         # lisible sur le bandeau sombre
+ORANGE = "#ea580c"
 
 
-class Caisse:
+class FenetreCaisse:
     def __init__(self, fenetre):
         self.fenetre = fenetre
         self.fenetre.title("PIC-MARKET")
         self.fenetre.geometry("1000x800")
+        self.fenetre.configure(bg=FOND)
 
-        self.panier = Panier()
+        self.caisse = Caisse()
+        self.etait_connecte = False     # pour detecter connexion / deconnexion
+
+        self.configurer_style()
         self.creer_elements()
 
-    # ------------------------------------------------------------ fenetre
+        self.fenetre.protocol("WM_DELETE_WINDOW", self.quitter)   # clic sur la croix
+        self.surveiller_usb()
+
+    def configurer_style(self):
+        """ttk ne prend pas font= / bg= directement : on passe par Style."""
+        style = ttk.Style()
+        style.theme_use("clam")         # theme qui accepte les couleurs
+        style.configure("Treeview", font=("Arial", 12), rowheight=30)
+        style.configure("Treeview.Heading", font=("Arial", 12, "bold"),
+                        background=BANDEAU, foreground=BLANC)
+        style.map("Treeview", background=[("selected", BLEU)])
+
+    # ================================================================ creation
     def creer_elements(self):
-        """Cree tous les elements de la fenetre."""
-        # Les noms Tkinter (tk.Label, ttk.Button, pack, config, text=, fg=...)
-        # restent en anglais : ils viennent de la bibliotheque, on ne peut pas
-        # les changer. Tout ce qu'on NOMME nous-memes est en francais.
-        # Les elements s'empilent de haut en bas dans l'ordre des .pack().
-        # Tous ceux qu'on modifiera plus tard sont stockes dans self.xxx
-        # (sinon on ne peut plus les retrouver dans les autres methodes).
+        self.creer_bandeau()
+        self.creer_dernier_code()
+        self.creer_simulation()
+        # Barre du bas et messages places AVANT le ticket : le ticket prend
+        # ensuite toute la place restante.
+        self.creer_barre_bas()
+        self.creer_messages()
+        self.creer_ticket()
 
-        # Statut USB deconnecte (rouge)
-        self.etiquette_usb = tk.Label(self.fenetre, text="USB : deconnecte", fg="red")
-        self.etiquette_usb.pack(anchor="w", padx=10, pady=5)
+    def creer_bandeau(self):
+        bandeau = tk.Frame(self.fenetre, bg=BANDEAU)
+        bandeau.pack(fill="x")
+        tk.Label(bandeau, text="PIC-MARKET", bg=BANDEAU, fg=BLANC,
+                 font=("Arial", 22, "bold")).pack(side="left", padx=15, pady=10)
+        # "●" = pastille de couleur
+        self.etiquette_usb = tk.Label(bandeau, text="● USB : Déconnecté", bg=BANDEAU,
+                                      fg=ROUGE_CLAIR, font=("Arial", 13, "bold"))
+        self.etiquette_usb.pack(side="right", padx=15)
 
-        # Dernier code recu (vert = reconnu, rouge = inconnu)
-        self.etiquette_dernier_code = tk.Label(self.fenetre, text="Code : ", fg="black")
-        self.etiquette_dernier_code.pack(anchor="w", padx=10, pady=5)
+    def creer_dernier_code(self):
+        self.etiquette_dernier_code = tk.Label(self.fenetre, bg=FOND, font=("Arial", 14, "bold"))
+        self.etiquette_dernier_code.pack(anchor="w", padx=10, pady=(10, 0))
+        self.afficher_dernier_code("-", "", "black")
 
-        # Zone de simulation (en attendant l'USB) : champ + bouton cote a cote.
-        # Placee AVANT le tableau pour qu'elle reste visible quand il grandit.
-        cadre_simulation = ttk.Frame(self.fenetre)
-        cadre_simulation.pack(fill="x", padx=10, pady=5)
+    def creer_simulation(self):
+        cadre = tk.LabelFrame(self.fenetre, text=" Mode simulation (sans PIC) ", bg=FOND,
+                              font=("Arial", 10, "bold"), padx=5, pady=5)
+        cadre.pack(fill="x", padx=10, pady=5)
 
-        ttk.Label(cadre_simulation, text="Code-barres :").pack(side="left")
-        self.champ_code = ttk.Entry(cadre_simulation, width=20)
-        self.champ_code.pack(side="left", padx=5)
-        # Touche Entree = scanner. bind() envoie un argument "event" qu'on ignore.
+        self.champ_code = tk.Entry(cadre, font=("Consolas", 13), width=25)
+        self.champ_code.pack(side="left", padx=(0, 5))
+        # Touche Entree = simuler. bind() envoie un argument "event" qu'on ignore.
         self.champ_code.bind("<Return>", lambda event: self.simuler_scan())
-        self.champ_code.focus()
+        tk.Button(cadre, text="Simuler un scan", bg=BLEU, fg=BLANC, relief="flat",
+                  font=("Arial", 11), command=self.simuler_scan).pack(side="left")
 
-        ttk.Button(cadre_simulation, text="Simuler un scan",
-                   command=self.simuler_scan).pack(side="left")
+    def creer_ticket(self):
+        cadre_tableau = tk.Frame(self.fenetre)
+        cadre_tableau.pack(fill="both", expand=True, padx=10, pady=5)
 
-        # Tableau des achats (TS4.2 : nom, prix unitaire, quantite, sous-total)
         colonnes = ("produit", "prix", "quantite", "sous_total")
-        self.tableau = ttk.Treeview(self.fenetre, columns=colonnes, show="headings")
-        self.tableau.heading("produit", text="Produit :")
-        self.tableau.heading("prix", text="Prix unitaire :")
-        self.tableau.heading("quantite", text="Quantite :")
-        self.tableau.heading("sous_total", text="Sous-total :")
-        self.tableau.column("produit", width=250)
-        self.tableau.column("prix", width=120, anchor="center")
-        self.tableau.column("quantite", width=80, anchor="center")
-        self.tableau.column("sous_total", width=120, anchor="center")
-        self.tableau.pack(fill="both", expand=True, padx=10, pady=5)
+        self.tableau = ttk.Treeview(cadre_tableau, columns=colonnes, show="headings")
+        self.tableau.heading("produit", text="Produit")
+        self.tableau.heading("prix", text="Prix unitaire")
+        self.tableau.heading("quantite", text="Quantité")
+        self.tableau.heading("sous_total", text="Sous-total")
+        self.tableau.column("produit", width=350)
+        self.tableau.column("prix", width=150, anchor="center")
+        self.tableau.column("quantite", width=100, anchor="center")
+        self.tableau.column("sous_total", width=150, anchor="center")
+        self.tableau.tag_configure("paire", background="#f3f4f6")   # lignes zebrees
 
-        # Bas de fenetre : bouton a gauche, total a droite
-        cadre_bas = ttk.Frame(self.fenetre)
-        cadre_bas.pack(fill="x", padx=10, pady=10)
+        defilement = ttk.Scrollbar(cadre_tableau, orient="vertical", command=self.tableau.yview)
+        self.tableau.configure(yscrollcommand=defilement.set)
+        defilement.pack(side="right", fill="y")
+        self.tableau.pack(side="left", fill="both", expand=True)
 
-        ttk.Button(cadre_bas, text="Nouvelle transaction",
-                   command=self.nouvelle_transaction).pack(side="left")
+    def creer_messages(self):
+        """Zone de messages (erreurs USB, trame invalide...), juste au-dessus de la barre."""
+        self.etiquette_message = tk.Label(self.fenetre, text="", bg=BLANC, fg=GRIS,
+                                          font=("Arial", 11), anchor="w", relief="solid", bd=1)
+        self.etiquette_message.pack(side="bottom", fill="x", padx=10, pady=(0, 5), ipady=4)
 
-        self.etiquette_total = tk.Label(cadre_bas, text="TOTAL : " + formater_prix(0),
-                                        font=("Arial", 20, "bold"))
-        self.etiquette_total.pack(side="right")
+    def creer_barre_bas(self):
+        """Total a gauche, boutons a droite."""
+        barre = tk.Frame(self.fenetre, bg=AFFICHEUR)
+        barre.pack(side="bottom", fill="x", padx=10, pady=(0, 10))
 
-        cadre_bouton_payer = ttk.LabelFrame(self.fenetre)
-        cadre_bouton_payer.pack(fill="x", padx=10, pady=5)
-        self.etiquette_payer = tk.Label(cadre_bouton_payer, text="PAYER : " + formater_prix(0),
-                                        font=("Arial", 20, "bold"))
-        self.etiquette_payer.pack(side="right")
+        tk.Label(barre, text="TOTAL", bg=AFFICHEUR, fg=BLANC,
+                 font=("Arial", 24, "bold")).pack(side="left", padx=15, pady=10)
+        self.etiquette_total = tk.Label(barre, text=formater_prix(0), bg=AFFICHEUR,
+                                        fg=CHIFFRES, font=("Consolas", 32, "bold"))
+        self.etiquette_total.pack(side="left", padx=15)
 
-    # actions
+        # side="right" : le premier bouton place est le plus a droite
+        tk.Button(barre, text="PAYER", font=("Arial", 18, "bold"), bg=VERT, fg=BLANC,
+                  activebackground=VERT, relief="flat", width=10
+                  ).pack(side="right", fill="y", padx=10, pady=10)
+        tk.Button(barre, text="Nouvelle\ntransaction", font=("Arial", 12, "bold"), bg=ORANGE,
+                  fg=BLANC, activebackground=ORANGE, relief="flat", width=12,
+                  command=self.nouvelle_transaction).pack(side="right", fill="y", pady=10)
+
+    # ================================================================ actions
     def simuler_scan(self):
-        """Fait ce que fera le PIC : chercher le code tape dans le catalogue,
-        puis appeler produit_recu() ou produit_inconnu()."""
-        code = self.champ_code.get().strip()
-        if not code:
-            return
-
-        # Seul endroit ou l'interface utilise chercher_produit()
-        # (option A : en vrai, c'est le PIC qui fait la recherche).
-        produit = chercher_produit(code)
-        if produit is None:
-            self.produit_inconnu(code)
-        else:
-            nom, prix = produit
-            self.produit_recu(code, nom, prix)
-
+        resultat = self.caisse.simuler_scan(self.champ_code.get())
         self.champ_code.delete(0, "end")
+        if resultat is not None:
+            self.afficher_resultat(resultat)
 
-    def produit_recu(self, code, nom, prix):
-        """Un produit valide arrive (du simulateur, plus tard de l'USB)."""
-        # Doit rester rapide (TS4.1 / TS4.3 : affichage < 500 ms).
-        self.panier.ajouter(code, nom, prix)
-        self.etiquette_dernier_code.config(
-            text=f"Code : {code} - {nom} (reconnu)", fg="green")
-        self.rafraichir_tableau()
+    def surveiller_usb(self):
+        """Lit les trames du PIC, met a jour le statut USB, puis se relance dans 50 ms."""
+        for resultat in self.caisse.lire_usb():
+            self.afficher_resultat(resultat)
 
-    def produit_inconnu(self, code):
-        """Code absent du catalogue : on l'affiche en rouge, le panier ne change pas."""
-        self.etiquette_dernier_code.config(
-            text=f"Code : {code} - INCONNU", fg="red")
+        connecte = self.caisse.usb_connecte()
+        if connecte != self.etait_connecte:          # l'etat vient de changer
+            if connecte:
+                self.etiquette_usb.config(text="● USB : Connecté", fg=CHIFFRES)
+                self.afficher_message("USB connecté.", VERT)
+            else:
+                self.etiquette_usb.config(text="● USB : Déconnecté", fg=ROUGE_CLAIR)
+                self.afficher_message("USB déconnecté : reconnexion automatique en cours...",
+                                      ROUGE)
+            self.etait_connecte = connecte
 
-    def ajouter_article(self, code):
-        """(TODO 6) Un article sans code-barres (fruit, pain) choisi dans le GUI."""
-        # TODO (bonus) :
-        #   - recuperer (nom, prix) dans ARTICLES_SANS_CODE
-        #   - REUTILISER self.produit_recu(code, nom, prix) : pas de code duplique,
-        #     et comme c'est vendu a l'unite, le panier gere deja les quantites
-        pass
+        # after() rappelle la methode sans bloquer la fenetre (contrairement a sleep)
+        self.fenetre.after(PERIODE_LECTURE_USB, self.surveiller_usb)
 
     def nouvelle_transaction(self):
-        """Vide le panier et remet l'affichage a zero (TS1.9)."""
-        self.panier.vider()
-        self.rafraichir_tableau()
-        self.etiquette_dernier_code.config(text="Code : ", fg="black")
-        # Plus tard (etape 5) : prevenir aussi le PIC avec envoyer_annulation()
-        # pour qu'il remette son GLCD a zero.
+        self.caisse.nouvelle_transaction()
+        self.rafraichir_ticket()
+        self.afficher_dernier_code("-", "", "black")
+        self.afficher_message("Nouvelle transaction.", GRIS)
 
-    # ---------------------------------------------------------- affichage
-    def rafraichir_tableau(self):
-        """Efface le tableau puis le reremplit a partir du panier + met a jour le total."""
-        # Tout effacer puis tout reremplir : simple, et l'ecran est toujours
-        # egal au panier (TS4.3 : la quantite s'incremente sur la meme ligne).
+    def quitter(self):
+        self.caisse.fermer()
+        self.fenetre.destroy()
+
+    # ================================================================ affichage
+    def afficher_resultat(self, resultat):
+        """Affiche un resultat renvoye par la caisse (voir caisse.py)."""
+        if resultat[0] == "reconnu":
+            _, code, nom, prix = resultat
+            self.afficher_dernier_code(code, f"Produit reconnu : {nom}", VERT)
+            self.rafraichir_ticket(dernier_code=code)
+        elif resultat[0] == "inconnu":
+            self.afficher_dernier_code(resultat[1], "Code inconnu", ROUGE)
+        else:
+            self.afficher_message("Trame USB invalide ignorée.", ROUGE)
+
+    def afficher_dernier_code(self, code, statut, couleur):
+        texte = f"Dernier code : {code}" + (f"   —   {statut}" if statut else "")
+        self.etiquette_dernier_code.config(text=texte, fg=couleur)
+
+    def afficher_message(self, texte, couleur):
+        self.etiquette_message.config(text="  " + texte, fg=couleur)
+
+    def rafraichir_ticket(self, dernier_code=None):
+        """Efface le ticket, le reremplit a partir du panier et met a jour le total."""
         self.tableau.delete(*self.tableau.get_children())
-        for ligne in self.panier.liste_lignes():
-            self.tableau.insert("", "end", values=(
+        for i, ligne in enumerate(self.caisse.panier.liste_lignes()):
+            tags = ("paire",) if i % 2 == 0 else ()
+            # iid = code : permet de retrouver la ligne d'un produit
+            self.tableau.insert("", "end", iid=ligne.code, tags=tags, values=(
                 ligne.nom,
                 formater_prix(ligne.prix_unitaire),
                 ligne.quantite,
                 formater_prix(ligne.sous_total()),
             ))
-        self.etiquette_total.config(text="TOTAL : " + formater_prix(self.panier.total()))
+        if dernier_code is not None:
+            self.tableau.selection_set(dernier_code)   # surligne le dernier produit recu
+            self.tableau.see(dernier_code)             # et fait defiler jusqu'a lui
+        self.etiquette_total.config(text=formater_prix(self.caisse.panier.total()))
 
 
 if __name__ == "__main__":
     fenetre = tk.Tk()
-    Caisse(fenetre)
+    FenetreCaisse(fenetre)
     fenetre.mainloop()
