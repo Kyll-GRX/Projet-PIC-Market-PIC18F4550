@@ -1,0 +1,17 @@
+# Python : fichiers compiles automatiquement
+__pycache__/
+*.pyc
+
+# Fichiers mis de cote (a supprimer)
+_to_delete/
+
+# MPLAB X : fichiers generes a chaque compilation
+build/
+dist/
+debug/
+nbproject/private/
+*.bak
+
+# Windows
+Thumbs.db
+desktop.ini
